@@ -121,6 +121,7 @@ name = "candle-marlin-moe"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "float8 0.6.1",
  "half",
  "marlin-moe",
  "tracing",

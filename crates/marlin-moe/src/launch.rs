@@ -1,7 +1,8 @@
 use core::ffi::c_void;
 
 use marlin_moe_sys::{
-    marlin_moe_align_block_size_i32 as sys_align, marlin_moe_gptq_repack as sys_repack,
+    marlin_moe_align_block_size_i32 as sys_align,
+    marlin_moe_fp8_pack_transpose as sys_fp8_pack_transpose, marlin_moe_gptq_repack as sys_repack,
     marlin_moe_scalar_type_id as sys_scalar_type_id, marlin_moe_scalar_type_t,
     marlin_moe_silu_and_mul_bf16, marlin_moe_silu_and_mul_fp16, marlin_moe_status_t,
     marlin_moe_sum_reduce_bf16, marlin_moe_sum_reduce_fp16, marlin_moe_sync_check,
@@ -21,6 +22,8 @@ pub enum ScalarType {
     U4B8,
     /// Asymmetric INT4 weight.
     U4,
+    /// E4M3 finite-and-NaN FP8 weight.
+    Fp8E4M3,
 }
 
 /// Returns the native scalar type identifier used in raw GEMM parameters.
@@ -30,11 +33,61 @@ pub fn scalar_type_id(scalar_type: ScalarType) -> Result<i64> {
         ScalarType::F16 => marlin_moe_scalar_type_t::MARLIN_MOE_SCALAR_FLOAT16,
         ScalarType::U4B8 => marlin_moe_scalar_type_t::MARLIN_MOE_SCALAR_U4B8,
         ScalarType::U4 => marlin_moe_scalar_type_t::MARLIN_MOE_SCALAR_U4,
+        ScalarType::Fp8E4M3 => marlin_moe_scalar_type_t::MARLIN_MOE_SCALAR_FE4M3FN,
     };
     let mut id = 0;
     let status = unsafe { sys_scalar_type_id(selector, &mut id) };
     check(status, "Marlin scalar type lookup failed")?;
     Ok(id)
+}
+
+/// Caller-owned raw FP8 packing buffers and CUDA execution context.
+///
+/// `weight` points to contiguous F8E4M3 `[N, K]`; `output` points to writable contiguous
+/// I32 `[K / 4, N]`. Both pointers belong to the stream's CUDA device, do not overlap, and
+/// remain live until the stream completes.
+#[derive(Debug, Copy, Clone)]
+pub struct Fp8PackTransposeParams {
+    /// FP8 input device pointer.
+    pub weight: *const u8,
+    /// Writable packed-and-transposed I32 output pointer.
+    pub output: *mut u32,
+    /// Input feature dimension, divisible by four.
+    pub k: usize,
+    /// Output feature dimension.
+    pub n: usize,
+    /// CUDA stream receiving the asynchronous launch.
+    pub stream: *mut c_void,
+}
+
+/// Validates and enqueues FP8 packing and transposition.
+///
+/// # Safety
+///
+/// The caller must uphold every pointer, shape, dtype, device, lifetime, aliasing, and stream
+/// requirement documented on [`Fp8PackTransposeParams`].
+pub unsafe fn fp8_pack_transpose(params: &Fp8PackTransposeParams) -> Result<()> {
+    if params.weight.is_null() || params.output.is_null() {
+        return Err(Error::InvalidArgument(
+            "FP8 pack input and output pointers must be non-null".into(),
+        ));
+    }
+    if params.k == 0 || params.k % 4 != 0 || params.n == 0 {
+        return Err(Error::InvalidArgument(format!(
+            "FP8 pack requires positive N and K divisible by four; got K={} N={}",
+            params.k, params.n
+        )));
+    }
+    let status = unsafe {
+        sys_fp8_pack_transpose(
+            params.weight,
+            params.output,
+            checked_i64(params.k, "FP8 pack K")?,
+            checked_i64(params.n, "FP8 pack N")?,
+            params.stream,
+        )
+    };
+    check(status, "Marlin FP8 pack transpose failed")
 }
 
 /// Caller-owned raw GPTQ repack buffers and CUDA execution context.
@@ -147,7 +200,7 @@ pub struct GemmLaunchParams {
     pub stream: *mut c_void,
 }
 
-/// Validates raw GEMM parameters and enqueues Marlin W4A16 GEMM.
+/// Validates raw GEMM parameters and enqueues a Marlin WNA16 GEMM.
 ///
 /// # Safety
 ///
@@ -181,9 +234,13 @@ pub unsafe fn wna16_gemm(params: &GemmLaunchParams) -> Result<()> {
             "asymmetric U4 weights require zero points".into(),
         ));
     }
-    if params.quantization.weight == WeightDtype::U4B8 && !params.b_zeros.is_null() {
+    if matches!(
+        params.quantization.weight,
+        WeightDtype::U4B8 | WeightDtype::Fp8E4M3
+    ) && !params.b_zeros.is_null()
+    {
         return Err(Error::InvalidArgument(
-            "symmetric U4B8 weights must not provide zero points".into(),
+            "symmetric U4B8 and FP8 weights must not provide zero points".into(),
         ));
     }
     let activation = match params.quantization.activation {
@@ -193,6 +250,7 @@ pub unsafe fn wna16_gemm(params: &GemmLaunchParams) -> Result<()> {
     let weight = match params.quantization.weight {
         WeightDtype::U4B8 => scalar_type_id(ScalarType::U4B8)?,
         WeightDtype::U4 => scalar_type_id(ScalarType::U4)?,
+        WeightDtype::Fp8E4M3 => scalar_type_id(ScalarType::Fp8E4M3)?,
     };
     let status = unsafe {
         sys_gemm(
@@ -224,7 +282,7 @@ pub unsafe fn wna16_gemm(params: &GemmLaunchParams) -> Result<()> {
             params.stream,
         )
     };
-    check(status, "Marlin W4A16 GEMM failed")
+    check(status, "Marlin WNA16 GEMM failed")
 }
 
 /// Caller-owned expert alignment buffers.
@@ -475,6 +533,20 @@ mod tests {
                 output: core::ptr::null_mut(),
                 is_a_8bit: false,
                 device: 0,
+                stream: core::ptr::null_mut(),
+            })
+        };
+        assert!(matches!(result, Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn rejects_invalid_fp8_pack_before_ffi() {
+        let result = unsafe {
+            fp8_pack_transpose(&Fp8PackTransposeParams {
+                weight: core::ptr::null(),
+                output: core::ptr::null_mut(),
+                k: 126,
+                n: 64,
                 stream: core::ptr::null_mut(),
             })
         };

@@ -1,4 +1,4 @@
-//! Marlin MoE W4A16 INT4 kernel bindings (port of vLLM's Marlin).
+//! Marlin MoE W4/W8A16 kernel bindings (port of vLLM's Marlin).
 //!
 //! Used on Hopper (SM90) for Kimi-K2.5-style checkpoints
 //! (compressed-tensors `symmetric: true`, `group_size: 32`, no act_order)
@@ -16,10 +16,12 @@
 //! `[out_features, in_features / 8]` INT32 (8 nibbles per int32) per
 //! Linear, packed in GPTQ nibble order. After per-expert stacking that's
 //!
-//!     fc1_packed: [E, 2 * inter, K / 8]    INT32
-//!     fc1_scale : [E, 2 * inter, K / group_size] BF16/FP16
-//!     fc2_packed: [E, K, inter / 8]        INT32
-//!     fc2_scale : [E, K, inter / group_size]     BF16/FP16
+//! ```text
+//! fc1_packed: [E, 2 * inter, K / 8]    INT32
+//! fc1_scale : [E, 2 * inter, K / group_size] BF16/FP16
+//! fc2_packed: [E, K, inter / 8]        INT32
+//! fc2_scale : [E, K, inter / group_size]     BF16/FP16
+//! ```
 //!
 //! Marlin's `gptq_marlin_repack` expects `[K / 8, N]` INT32 per expert
 //! (transposed) and produces `[K / 16, N * 2]` INT32 in its tile-interleaved
@@ -32,6 +34,8 @@
 //!   loads (Flashinfer-style layout) and returns a Marlin-ready handle.
 //! - [`MarlinInt4Moe::forward`] — full fc1 → SiLU·mul → fc2 → topk-sum
 //!   pipeline; matches `_fused_marlin_moe` from vLLM.
+//! - [`MarlinFp8Moe::from_blockscaled_weights`] — SM12x FP8 repacking and
+//!   128-by-128 block-scale expansion for Qwen-style checkpoints.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -42,8 +46,9 @@ use candle::{
     cuda::cudarc::driver::sys::{CUresult, cuMemsetD8Async},
 };
 use marlin_moe::{
-    ActivationDtype, AlignLaunchParams, GemmDims, GemmLaunchParams, Quantization, RepackDims,
-    RepackLaunchParams, SiluLaunchParams, SumReduceLaunchParams, WeightDtype,
+    ActivationDtype, AlignLaunchParams, Fp8PackTransposeParams, GemmDims, GemmLaunchParams,
+    Quantization, RepackDims, RepackLaunchParams, SiluLaunchParams, SumReduceLaunchParams,
+    WeightDtype,
 };
 
 fn marlin<T>(result: marlin_moe::Result<T>) -> Result<T> {
@@ -147,6 +152,24 @@ pub fn marlin_gptq_repack(b_q_weight: &Tensor) -> Result<Tensor> {
     let (rows, cols) = b_q_weight.dims2()?;
     let size_k = rows * 8;
     let size_n = cols;
+    marlin_gptq_repack_bits(b_q_weight, size_k, size_n, 4)
+}
+
+fn marlin_gptq_repack_bits(
+    b_q_weight: &Tensor,
+    size_k: usize,
+    size_n: usize,
+    bits: usize,
+) -> Result<Tensor> {
+    let pack_factor = 32 / bits;
+    if b_q_weight.dims() != [size_k / pack_factor, size_n] {
+        bail!(
+            "marlin_gptq_repack: expected packed shape [{}, {}], got {:?}",
+            size_k / pack_factor,
+            size_n,
+            b_q_weight.dims()
+        );
+    }
     if size_k % 16 != 0 {
         bail!(
             "marlin_gptq_repack: size_k = {} must be divisible by 16",
@@ -171,7 +194,7 @@ pub fn marlin_gptq_repack(b_q_weight: &Tensor) -> Result<Tensor> {
     let dev_ordinal = stream.context().ordinal() as i32;
 
     let b_q_weight = b_q_weight.contiguous()?;
-    let out_shape = (size_k / 16, size_n * 2);
+    let out_shape = (size_k / 16, size_n * 16 / pack_factor);
     let out = Tensor::zeros(out_shape, DType::I32, b_q_weight.device())?;
 
     // Scoped storage borrows so `out` can be moved into the return.
@@ -185,7 +208,7 @@ pub fn marlin_gptq_repack(b_q_weight: &Tensor) -> Result<Tensor> {
                 dims: RepackDims {
                     k: size_k,
                     n: size_n,
-                    bits: 4,
+                    bits,
                 },
                 input: b_ptr.as_const::<u32>(),
                 perm: core::ptr::null(),
@@ -198,6 +221,40 @@ pub fn marlin_gptq_repack(b_q_weight: &Tensor) -> Result<Tensor> {
         })?;
     }
     Ok(out)
+}
+
+fn marlin_fp8_repack(weight: &Tensor) -> Result<Tensor> {
+    let (size_n, size_k) = weight.dims2()?;
+    if weight.dtype() != DType::F8E4M3 {
+        bail!(
+            "marlin_fp8_repack: weight must be F8E4M3, got {:?}",
+            weight.dtype()
+        );
+    }
+    if size_k % 16 != 0 || size_n % 64 != 0 {
+        bail!(
+            "marlin_fp8_repack: shape [{size_n}, {size_k}] requires N divisible by 64 and K divisible by 16"
+        );
+    }
+    let weight = weight.contiguous()?;
+    let packed = Tensor::zeros((size_k / 4, size_n), DType::I32, weight.device())?;
+    let stream = weight.device().as_cuda_device()?.cuda_stream();
+    {
+        let (weight_s, weight_l) = weight.storage_and_layout();
+        let (packed_s, packed_l) = packed.storage_and_layout();
+        let weight_ptr = cuda_any(&weight_s, weight_l.start_offset(), DType::F8E4M3, &stream)?;
+        let packed_ptr = cuda_i32(&packed_s, packed_l.start_offset(), &stream)?;
+        marlin(unsafe {
+            marlin_moe::fp8_pack_transpose(&Fp8PackTransposeParams {
+                weight: weight_ptr.as_const::<u8>(),
+                output: packed_ptr.as_mut::<u32>(),
+                k: size_k,
+                n: size_n,
+                stream: stream.cu_stream().cast(),
+            })
+        })?;
+    }
+    marlin_gptq_repack_bits(&packed, size_k, size_n, 8)
 }
 
 /// Per-`M` scratch buffer set for `MarlinInt4Moe::forward`.
@@ -467,6 +524,21 @@ fn dtype_id(d: DType) -> u8 {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MarlinWeightType {
+    Int4,
+    Fp8,
+}
+
+impl MarlinWeightType {
+    fn dtype(self) -> WeightDtype {
+        match self {
+            Self::Int4 => WeightDtype::U4B8,
+            Self::Fp8 => WeightDtype::Fp8E4M3,
+        }
+    }
+}
+
 /// Preprocessed Marlin MoE handle. Holds the tile-interleaved weights,
 /// permuted scales, persistent workspace buffer, and shape metadata.
 #[derive(Debug)]
@@ -484,6 +556,7 @@ pub struct MarlinInt4Moe {
     inter_size: usize,
     group_size: usize,
     scale_dtype: DType,
+    weight_type: MarlinWeightType,
 }
 
 impl MarlinInt4Moe {
@@ -507,8 +580,11 @@ impl MarlinInt4Moe {
     ) -> Result<Self> {
         let (e1, two_inter, k_div_8) = fc1_packed.dims3()?;
         let (e2, k, inter_div_8) = fc2_packed.dims3()?;
-        if e1 != e2 {
+        if e1 == 0 || e1 != e2 {
             bail!("Marlin: fc1/fc2 expert count mismatch ({} vs {})", e1, e2);
+        }
+        if fc1_packed.dtype() != DType::I32 || fc2_packed.dtype() != DType::I32 {
+            bail!("Marlin: packed expert weights must be I32");
         }
         if two_inter % 2 != 0 {
             bail!("Marlin: fc1 out_features {} is not even", two_inter);
@@ -530,9 +606,9 @@ impl MarlinInt4Moe {
                 k
             );
         }
-        if k % group_size != 0 || inter % group_size != 0 {
+        if !matches!(group_size, 32 | 64 | 128) || k % group_size != 0 || inter % group_size != 0 {
             bail!(
-                "Marlin: group_size {} must divide both K ({}) and inter ({})",
+                "Marlin: group_size {} must be 32, 64, or 128 and divide both K ({}) and inter ({})",
                 group_size,
                 k,
                 inter
@@ -549,6 +625,27 @@ impl MarlinInt4Moe {
         }
         if !matches!(scale_dtype, DType::BF16 | DType::F16) {
             bail!("Marlin: scales must be BF16 or F16, got {:?}", scale_dtype);
+        }
+        let expected_fc1_scales = [e1, two_inter, k / group_size];
+        let expected_fc2_scales = [e1, k, inter / group_size];
+        if fc1_scales.dims() != expected_fc1_scales || fc2_scales.dims() != expected_fc2_scales {
+            bail!(
+                "Marlin: expected scale shapes {:?} and {:?}, got {:?} and {:?}",
+                expected_fc1_scales,
+                expected_fc2_scales,
+                fc1_scales.dims(),
+                fc2_scales.dims()
+            );
+        }
+        let device = fc1_packed.device();
+        for (name, tensor) in [
+            ("fc2_packed", fc2_packed),
+            ("fc1_scales", fc1_scales),
+            ("fc2_scales", fc2_scales),
+        ] {
+            if !device.same_device(tensor.device()) {
+                bail!("Marlin: {name} must be on the same device as fc1_packed");
+            }
         }
 
         // ---- repack each expert's fc1 ----
@@ -588,6 +685,7 @@ impl MarlinInt4Moe {
             inter_size: inter,
             group_size,
             scale_dtype,
+            weight_type: MarlinWeightType::Int4,
         })
     }
 
@@ -697,6 +795,15 @@ impl MarlinInt4Moe {
         if m_tk != m {
             bail!("MarlinInt4Moe.forward: topk_ids rows {} != M {}", m_tk, m);
         }
+        let topk_weight_dims = topk_weights.dims2()?;
+        if topk_weight_dims != (m, top_k) {
+            bail!(
+                "MarlinInt4Moe.forward: topk_weights shape {:?} must equal [{}, {}]",
+                topk_weight_dims,
+                m,
+                top_k
+            );
+        }
         if xs.dtype() != self.scale_dtype {
             bail!(
                 "MarlinInt4Moe.forward: xs dtype {:?} must match scale dtype {:?}",
@@ -709,6 +816,18 @@ impl MarlinInt4Moe {
             Device::Cuda(_) => xs.device().as_cuda_device()?,
             _ => bail!("MarlinInt4Moe.forward: xs must be on CUDA"),
         };
+        for (name, tensor) in [
+            ("topk_ids", topk_ids),
+            ("topk_weights", topk_weights),
+            ("fc1_qweight", &self.fc1_qweight),
+            ("fc1_scales", &self.fc1_scales),
+            ("fc2_qweight", &self.fc2_qweight),
+            ("fc2_scales", &self.fc2_scales),
+        ] {
+            if !xs.device().same_device(tensor.device()) {
+                bail!("MarlinInt4Moe.forward: {name} must be on the xs device");
+            }
+        }
         let stream = cuda_dev.cuda_stream();
         let dev_ordinal = stream.context().ordinal() as i32;
 
@@ -1018,7 +1137,7 @@ impl MarlinInt4Moe {
                 },
                 quantization: Quantization {
                     activation: activation_dtype(self.scale_dtype)?,
-                    weight: WeightDtype::U4B8,
+                    weight: self.weight_type.dtype(),
                     group_size: self.group_size,
                 },
                 a: a_ptr.as_const_void(),
@@ -1039,6 +1158,180 @@ impl MarlinInt4Moe {
             })
         })
     }
+}
+
+/// Preprocessed Marlin W8A16 MoE handle for 128-by-128 block-scaled FP8 checkpoints.
+///
+/// The handle owns repacked I32 Marlin weights and BF16 scales on one CUDA device. It supports
+/// BF16 activations and output with the same routed execution, scratch sharing, and stream
+/// behavior as [`MarlinInt4Moe`].
+#[derive(Debug)]
+pub struct MarlinFp8Moe {
+    inner: MarlinInt4Moe,
+}
+
+impl MarlinFp8Moe {
+    /// Repack FP8 expert weights and expand checkpoint block scales into Marlin layout.
+    ///
+    /// `fc1_weights` is contiguous-compatible F8E4M3 `[E, 2 * inter, hidden]` in `[up | gate]`
+    /// order and `fc2_weights` is F8E4M3 `[E, hidden, inter]`. Their F32 scale tensors are
+    /// `[E, 2 * inter / 128, hidden / 128]` and
+    /// `[E, hidden / 128, inter / 128]`. All tensors must share one CUDA device, and hidden and
+    /// intermediate dimensions must be divisible by 128. The returned handle owns contiguous,
+    /// asynchronously repacked weights and scales on that device.
+    pub fn from_blockscaled_weights(
+        fc1_weights: &Tensor,
+        fc1_block_scales: &Tensor,
+        fc2_weights: &Tensor,
+        fc2_block_scales: &Tensor,
+    ) -> Result<Self> {
+        let (num_experts, two_inter, hidden) = fc1_weights.dims3()?;
+        let (fc2_experts, fc2_hidden, inter) = fc2_weights.dims3()?;
+        if num_experts == 0
+            || num_experts != fc2_experts
+            || hidden != fc2_hidden
+            || two_inter != inter.checked_mul(2).unwrap_or(usize::MAX)
+        {
+            bail!(
+                "Marlin FP8: incompatible fc1/fc2 shapes {:?} and {:?}",
+                fc1_weights.dims(),
+                fc2_weights.dims()
+            );
+        }
+        if fc1_weights.dtype() != DType::F8E4M3 || fc2_weights.dtype() != DType::F8E4M3 {
+            bail!("Marlin FP8: expert weights must be F8E4M3");
+        }
+        if fc1_block_scales.dtype() != DType::F32 || fc2_block_scales.dtype() != DType::F32 {
+            bail!("Marlin FP8: checkpoint block scales must be F32");
+        }
+        if hidden % 128 != 0 || inter % 128 != 0 {
+            bail!(
+                "Marlin FP8: hidden/inter dimensions must be divisible by 128, got hidden={hidden} inter={inter}"
+            );
+        }
+        let device = fc1_weights.device();
+        for (name, tensor) in [
+            ("fc2_weights", fc2_weights),
+            ("fc1_block_scales", fc1_block_scales),
+            ("fc2_block_scales", fc2_block_scales),
+        ] {
+            if !device.same_device(tensor.device()) {
+                bail!("Marlin FP8: {name} must be on the same device as fc1_weights");
+            }
+        }
+        let _ = device.as_cuda_device()?;
+        validate_fp8_block_scale_shape(fc1_block_scales, num_experts, two_inter, hidden)?;
+        validate_fp8_block_scale_shape(fc2_block_scales, num_experts, hidden, inter)?;
+
+        let mut fc1_repacked = Vec::with_capacity(num_experts);
+        let mut fc2_repacked = Vec::with_capacity(num_experts);
+        for expert in 0..num_experts {
+            fc1_repacked.push(marlin_fp8_repack(&fc1_weights.i(expert)?)?);
+            fc2_repacked.push(marlin_fp8_repack(&fc2_weights.i(expert)?)?);
+        }
+        let fc1_qweight = Tensor::stack(&fc1_repacked, 0)?.contiguous()?;
+        let fc2_qweight = Tensor::stack(&fc2_repacked, 0)?.contiguous()?;
+        let fc1_scales = expand_fp8_block_scales(fc1_block_scales, num_experts, two_inter, hidden)?;
+        let fc2_scales = expand_fp8_block_scales(fc2_block_scales, num_experts, hidden, inter)?;
+
+        Ok(Self {
+            inner: MarlinInt4Moe {
+                fc1_qweight,
+                fc1_scales,
+                fc2_qweight,
+                fc2_scales,
+                num_experts,
+                hidden_size: hidden,
+                inter_size: inter,
+                group_size: 128,
+                scale_dtype: DType::BF16,
+                weight_type: MarlinWeightType::Fp8,
+            },
+        })
+    }
+
+    /// Preallocates reusable CUDA scratch for at most `max_tokens` routed through `top_k` experts.
+    ///
+    /// `device` must be the same CUDA device that owns the handle's weights. The allocation is
+    /// shared by compatible Marlin handles executing sequentially on that device and stream.
+    pub fn prealloc_scratch(&self, max_tokens: usize, top_k: usize, device: &Device) -> Result<()> {
+        if !self.inner.fc1_qweight.device().same_device(device) {
+            bail!("Marlin FP8: scratch device must match the weight device");
+        }
+        self.inner.prealloc_scratch(max_tokens, top_k, device)
+    }
+
+    /// Returns the required BF16 activation and output dtype.
+    pub fn activation_dtype(&self) -> DType {
+        DType::BF16
+    }
+
+    /// Runs routed FP8 fc1, gated-SiLU, FP8 fc2, and top-k reduction.
+    ///
+    /// `xs` is contiguous-compatible BF16 `[M, hidden]`, `topk_ids` is I32/U32 `[M, top_k]`,
+    /// and `topk_weights` is numeric `[M, top_k]` converted to F32. Inputs must share the
+    /// handle's CUDA device. Global expert ids are rebased by `expert_id_offset`; non-local
+    /// experts contribute zero. The returned tensor is BF16 `[M, hidden]` on the same device.
+    pub fn forward(
+        &self,
+        xs: &Tensor,
+        topk_ids: &Tensor,
+        topk_weights: &Tensor,
+        expert_id_offset: i32,
+    ) -> Result<Tensor> {
+        if xs.dtype() != DType::BF16 {
+            bail!("Marlin FP8: activations must be BF16, got {:?}", xs.dtype());
+        }
+        let device = self.inner.fc1_qweight.device();
+        for (name, tensor) in [
+            ("xs", xs),
+            ("topk_ids", topk_ids),
+            ("topk_weights", topk_weights),
+        ] {
+            if !device.same_device(tensor.device()) {
+                bail!("Marlin FP8: {name} must be on the weight device");
+            }
+        }
+        self.inner
+            .forward(xs, topk_ids, topk_weights, expert_id_offset)
+    }
+}
+
+fn validate_fp8_block_scale_shape(
+    scales: &Tensor,
+    num_experts: usize,
+    size_n: usize,
+    size_k: usize,
+) -> Result<()> {
+    let expected = [num_experts, size_n / 128, size_k / 128];
+    if scales.dims() != expected {
+        bail!(
+            "Marlin FP8: expected block scales {:?}, got {:?}",
+            expected,
+            scales.dims()
+        );
+    }
+    Ok(())
+}
+
+fn expand_fp8_block_scales(
+    scales: &Tensor,
+    num_experts: usize,
+    size_n: usize,
+    size_k: usize,
+) -> Result<Tensor> {
+    validate_fp8_block_scale_shape(scales, num_experts, size_n, size_k)?;
+    let num_groups = size_k / 128;
+    // Marlin's FP8 dequant path reuses BF16 fragments. Fold the E4M3-to-BF16 exponent-bias
+    // difference into the scale, matching vLLM's FP8 Marlin preprocessing.
+    let expanded = scales
+        .affine(2f64.powi(120), 0.0)?
+        .to_dtype(DType::BF16)?
+        .unsqueeze(2)?
+        .broadcast_as((num_experts, size_n / 128, 128, num_groups))?
+        .contiguous()?
+        .reshape((num_experts, size_n, num_groups))?;
+    transpose_and_permute_scales(&expanded, num_experts, size_n, num_groups)
 }
 
 /// Transpose a `[E, N, num_groups]` scale tensor to `[E, num_groups, N]` and
@@ -1100,6 +1393,35 @@ mod validation_tests {
         assert!(
             MarlinInt4Moe::from_packed_weights(&fc1, &fc1_scales, &fc2, &fc2_scales, 32,).is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_block_scales_expand_nonuniform_output_blocks() -> Result<()> {
+        let scales = Tensor::from_vec(vec![1.0f32, 2.0], (1, 2, 1), &Device::Cpu)?;
+        let expanded = expand_fp8_block_scales(&scales, 1, 256, 128)?
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        assert_eq!(expanded.len(), 256);
+        let low = 2f32.powi(120);
+        assert!(
+            expanded[..128]
+                .iter()
+                .all(|value| (*value - low).abs() <= low * 0.01)
+        );
+        assert!(
+            expanded[128..]
+                .iter()
+                .all(|value| (*value - 2.0 * low).abs() <= low * 0.02)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_block_scale_validation_rejects_wrong_shape_before_cuda() -> Result<()> {
+        let scales = Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu)?;
+        assert!(validate_fp8_block_scale_shape(&scales, 1, 256, 128).is_err());
         Ok(())
     }
 }
@@ -1236,5 +1558,71 @@ mod sum_reduce_tests {
     #[ignore = "requires a visible SM90 CUDA GPU"]
     fn sm90_fp16_forward_smoke() -> Result<()> {
         synthetic_forward(DType::F16)
+    }
+
+    #[test]
+    #[ignore = "requires a visible SM120 or SM121 CUDA GPU"]
+    fn sm12x_fp8_forward_uses_distinct_gate_and_up_weights() -> Result<()> {
+        let device = Device::new_cuda(0)?;
+        let (major, minor) = device
+            .as_cuda_device()?
+            .cuda_stream()
+            .context()
+            .compute_capability()
+            .map_err(candle::Error::msg)?;
+        if major != 12 || !matches!(minor, 0 | 1) {
+            return Ok(());
+        }
+
+        let num_experts = 2;
+        let hidden = 128;
+        let inter = 128;
+        let up = float8::F8E4M3::from_f32(1.0 / 64.0).to_bits();
+        let gate = float8::F8E4M3::from_f32(1.0 / 32.0).to_bits();
+        let down = float8::F8E4M3::from_f32(1.0 / 64.0).to_bits();
+        let mut fc1_bytes = vec![up; num_experts * 2 * inter * hidden];
+        for expert in 0..num_experts {
+            let expert_base = expert * 2 * inter * hidden;
+            fc1_bytes[expert_base + inter * hidden..expert_base + 2 * inter * hidden].fill(gate);
+        }
+        let fc1 = Tensor::from_raw_buffer(
+            &fc1_bytes,
+            DType::F8E4M3,
+            &[num_experts, 2 * inter, hidden],
+            &Device::Cpu,
+        )?
+        .to_device(&device)?;
+        let fc2 = Tensor::from_raw_buffer(
+            &vec![down; num_experts * hidden * inter],
+            DType::F8E4M3,
+            &[num_experts, hidden, inter],
+            &Device::Cpu,
+        )?
+        .to_device(&device)?;
+        let fc1_scales = Tensor::ones((num_experts, 2, 1), DType::F32, &device)?;
+        let fc2_scales = Tensor::ones((num_experts, 1, 1), DType::F32, &device)?;
+        let moe = MarlinFp8Moe::from_blockscaled_weights(&fc1, &fc1_scales, &fc2, &fc2_scales)?;
+        moe.prealloc_scratch(2, 1, &device)?;
+
+        let xs = Tensor::full(0.5f32, (2, hidden), &device)?.to_dtype(DType::BF16)?;
+        let ids = Tensor::from_vec(vec![0i32, 1], (2, 1), &device)?;
+        let routing = Tensor::ones((2, 1), DType::F32, &device)?;
+        let output = moe.forward(&xs, &ids, &routing, 0)?;
+        device.synchronize()?;
+        let got = output
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let up_value = hidden as f32 * 0.5 / 64.0;
+        let gate_value = hidden as f32 * 0.5 / 32.0;
+        let activated = gate_value / (1.0 + (-gate_value).exp()) * up_value;
+        let expected = inter as f32 * activated / 64.0;
+        assert!(
+            got.iter().all(|value| (*value - expected).abs() < 0.08),
+            "expected output near {expected}, got {:?}..{:?}",
+            got.iter().copied().reduce(f32::min),
+            got.iter().copied().reduce(f32::max)
+        );
+        Ok(())
     }
 }

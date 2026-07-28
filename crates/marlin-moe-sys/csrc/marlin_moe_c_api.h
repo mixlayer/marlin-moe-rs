@@ -20,6 +20,7 @@ typedef enum marlin_moe_scalar_type_t {
   MARLIN_MOE_SCALAR_FLOAT16 = 1,
   MARLIN_MOE_SCALAR_U4B8 = 2,
   MARLIN_MOE_SCALAR_U4 = 3,
+  MARLIN_MOE_SCALAR_FE4M3FN = 4,
 } marlin_moe_scalar_type_t;
 
 const char* marlin_moe_last_error(void);
@@ -31,6 +32,10 @@ marlin_moe_status_t marlin_moe_gptq_repack(
     const uint32_t* b_q_weight_ptr, const uint32_t* perm_ptr,
     int64_t perm_size, uint32_t* out_ptr, int64_t size_k, int64_t size_n,
     int64_t num_bits, bool is_a_8bit, int device, cudaStream_t stream);
+
+marlin_moe_status_t marlin_moe_fp8_pack_transpose(
+    const uint8_t* weight_ptr, uint32_t* packed_transposed_ptr,
+    int64_t size_k, int64_t size_n, cudaStream_t stream);
 
 marlin_moe_status_t marlin_moe_wna16_c_tmp_elems(
     int64_t size_n, int64_t padded_total, int64_t moe_block_size, int device,
@@ -74,4 +79,3 @@ marlin_moe_status_t marlin_moe_sync_check(cudaStream_t stream);
 #ifdef __cplusplus
 }
 #endif
-

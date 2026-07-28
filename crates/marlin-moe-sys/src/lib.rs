@@ -37,6 +37,8 @@ pub enum marlin_moe_scalar_type_t {
     MARLIN_MOE_SCALAR_U4B8 = 2,
     /// Asymmetric unsigned INT4 weights with explicit zero points.
     MARLIN_MOE_SCALAR_U4 = 3,
+    /// E4M3 finite-and-NaN FP8 weights.
+    MARLIN_MOE_SCALAR_FE4M3FN = 4,
 }
 
 #[cfg(not(feature = "unsupported_arch"))]
@@ -64,6 +66,18 @@ unsafe extern "C" {
         num_bits: i64,
         is_a_8bit: bool,
         device: c_int,
+        stream: cudaStream_t,
+    ) -> marlin_moe_status_t;
+
+    /// Enqueues packing and transposition from FP8 `[N, K]` into I32 `[K / 4, N]`.
+    ///
+    /// Both buffers are contiguous CUDA allocations on the stream's device and remain valid
+    /// through stream completion. The output is writable and non-overlapping.
+    pub fn marlin_moe_fp8_pack_transpose(
+        weight_ptr: *const u8,
+        packed_transposed_ptr: *mut u32,
+        size_k: i64,
+        size_n: i64,
         stream: cudaStream_t,
     ) -> marlin_moe_status_t;
 
@@ -210,6 +224,10 @@ mod unsupported {
         out_ptr: *mut u32, size_k: i64, size_n: i64, num_bits: i64,
         is_a_8bit: bool, device: c_int, stream: cudaStream_t
     ) -> marlin_moe_status_t);
+    unsupported!(marlin_moe_fp8_pack_transpose(
+        weight_ptr: *const u8, packed_transposed_ptr: *mut u32,
+        size_k: i64, size_n: i64, stream: cudaStream_t
+    ) -> marlin_moe_status_t);
     unsupported!(marlin_moe_wna16_c_tmp_elems(
         size_n: i64, padded_total: i64, moe_block_size: i64, device: c_int,
         elements: *mut i64
@@ -267,6 +285,10 @@ mod tests {
         assert_eq!(
             marlin_moe_status_t::MARLIN_MOE_STATUS_UNSUPPORTED_ARCH as i32,
             2
+        );
+        assert_eq!(
+            marlin_moe_scalar_type_t::MARLIN_MOE_SCALAR_FE4M3FN as i32,
+            4
         );
     }
 

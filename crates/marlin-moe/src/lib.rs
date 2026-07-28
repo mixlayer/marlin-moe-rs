@@ -15,8 +15,8 @@ pub use arch::Arch;
 pub use config::{ActivationDtype, GemmDims, Quantization, RepackDims, WeightDtype};
 pub use error::{Error, Result};
 pub use launch::{
-    AlignLaunchParams, GemmLaunchParams, RepackLaunchParams, ScalarType, SiluLaunchParams,
-    SumReduceLaunchParams, align_block_size_i32, gptq_repack, scalar_type_id, silu_and_mul,
-    sum_reduce, sync_check, wna16_gemm,
+    AlignLaunchParams, Fp8PackTransposeParams, GemmLaunchParams, RepackLaunchParams, ScalarType,
+    SiluLaunchParams, SumReduceLaunchParams, align_block_size_i32, fp8_pack_transpose, gptq_repack,
+    scalar_type_id, silu_and_mul, sum_reduce, sync_check, wna16_gemm,
 };
 pub use workspace::{ScratchLayout, c_tmp_elements};

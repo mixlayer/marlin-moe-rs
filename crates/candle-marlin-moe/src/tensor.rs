@@ -4,7 +4,7 @@ use candle::{
     DType, Result, Storage,
     cuda::{
         CudaDType,
-        cudarc::driver::{CudaStream, DevicePtr, DeviceRepr, SyncOnDrop},
+        cudarc::driver::{CudaStream, DevicePtr, SyncOnDrop},
     },
 };
 
@@ -57,6 +57,7 @@ pub(crate) fn cuda_any<'a>(
         DType::F32 => cuda_typed::<f32>(storage, start_element, stream),
         DType::I32 => cuda_typed::<i32>(storage, start_element, stream),
         DType::U32 => cuda_typed::<u32>(storage, start_element, stream),
+        DType::F8E4M3 => cuda_typed::<float8::F8E4M3>(storage, start_element, stream),
         _ => candle::bail!("Marlin tensor pointer: unsupported dtype {:?}", dtype),
     }
 }
@@ -79,7 +80,7 @@ pub(crate) fn cuda_f32<'a>(
     cuda_typed::<f32>(storage, start_element, stream)
 }
 
-fn cuda_typed<'a, T: CudaDType + DeviceRepr + 'a>(
+fn cuda_typed<'a, T: CudaDType + 'a>(
     storage: &'a Storage,
     start_element: usize,
     stream: &'a CudaStream,

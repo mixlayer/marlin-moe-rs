@@ -61,6 +61,9 @@ marlin_moe_status_t marlin_moe_scalar_type_id(
       case MARLIN_MOE_SCALAR_U4:
         *id = marlin_moe_impl_scalar_type_id_u4();
         break;
+      case MARLIN_MOE_SCALAR_FE4M3FN:
+        *id = marlin_moe_impl_scalar_type_id_fe4m3fn();
+        break;
       default:
         throw std::invalid_argument("unknown scalar type");
     }
@@ -77,6 +80,19 @@ marlin_moe_status_t marlin_moe_gptq_repack(
     marlin_moe_impl_gptq_repack(b_q_weight_ptr, perm_ptr, perm_size, out_ptr,
                                 size_k, size_n, num_bits, is_a_8bit, device,
                                 stream);
+  });
+}
+
+marlin_moe_status_t marlin_moe_fp8_pack_transpose(
+    const uint8_t* weight_ptr, uint32_t* packed_transposed_ptr,
+    int64_t size_k, int64_t size_n, cudaStream_t stream) {
+  if (weight_ptr == nullptr || packed_transposed_ptr == nullptr)
+    return invalid("FP8 pack input and output pointers must be non-null");
+  if (size_k <= 0 || size_n <= 0 || size_k % 4 != 0)
+    return invalid("FP8 pack dimensions must be positive and K divisible by four");
+  return guarded([&] {
+    marlin_moe_impl_fp8_pack_transpose(
+        weight_ptr, packed_transposed_ptr, size_k, size_n, stream);
   });
 }
 

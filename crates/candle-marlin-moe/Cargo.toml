@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 candle = { git = "https://github.com/mixlayer/candle", package = "candle-core", branch = "fix/add-i16-i32-cuda-kernels", features = ["cuda"] }
+float8 = "0.6.1"
 half = "2.4.1"
 marlin-moe.workspace = true
 tracing = "0.1"

@@ -276,6 +276,42 @@ __global__ void gptq_marlin_repack_kernel(
             b_q_weight_ptr, perm_ptr, out_ptr, size_k, size_n);             \
   }
 
+__global__ void marlin_moe_impl_fp8_pack_transpose_kernel(
+    const uint8_t* weight,
+    uint32_t* packed_transposed,
+    int64_t size_k,
+    int64_t size_n) {
+  const int64_t packed_k = size_k / 4;
+  const int64_t idx =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total = size_n * packed_k;
+  if (idx >= total) return;
+
+  const int64_t n = idx / packed_k;
+  const int64_t k4 = idx - n * packed_k;
+  const uint8_t* src = weight + n * size_k + k4 * 4;
+  const uint32_t packed = static_cast<uint32_t>(src[0]) |
+                          (static_cast<uint32_t>(src[1]) << 8) |
+                          (static_cast<uint32_t>(src[2]) << 16) |
+                          (static_cast<uint32_t>(src[3]) << 24);
+  packed_transposed[k4 * size_n + n] = packed;
+}
+
+extern "C" void marlin_moe_impl_fp8_pack_transpose(
+    const uint8_t* weight_ptr,
+    uint32_t* packed_transposed_ptr,
+    int64_t size_k,
+    int64_t size_n,
+    cudaStream_t stream) {
+  TORCH_CHECK(size_k % 4 == 0,
+              "FP8 Marlin pack requires size_k divisible by 4");
+  constexpr int threads = 256;
+  const int64_t total = size_n * (size_k / 4);
+  const int blocks = static_cast<int>((total + threads - 1) / threads);
+  marlin_moe_impl_fp8_pack_transpose_kernel<<<blocks, threads, 0, stream>>>(
+      weight_ptr, packed_transposed_ptr, size_k, size_n);
+}
+
 extern "C" void marlin_moe_impl_gptq_repack(
     const uint32_t* b_q_weight_ptr,
     const uint32_t* perm_ptr,

@@ -15,11 +15,11 @@ SUPPORT_SM80 = False
 for arch in sys.argv[1].split(","):
     arch = arch[: arch.index(".") + 2].replace(".", "")
     arch = int(arch)
-    # SM89 and the SM12x family (SM120 RTX 5090, SM121 DGX Spark GB10)
-    # fully support mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32.
+    # SM120 and SM121 fully support
+    # mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32.
     # SM90 and SM100 can use this PTX, but it’s simulated
     # with FP16 MMA, so it cannot achieve any acceleration.
-    if arch == 89 or arch // 10 == 12:
+    if arch in [120, 121]:
         SUPPORT_FP8 = True
     if arch >= 80:
         SUPPORT_SM80 = True
@@ -62,9 +62,9 @@ THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128), (128, 64, 128
 
 THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
 
-# modeld-kernels port: only emit the BF16/FP16 × INT4 W4A16 kernels we
-# need for Kimi K2.5 (compressed-tensors symmetric INT4, group_size=32 → 128).
-# group_blocks ∈ {-1 (per-channel), 2 (g32), 4 (g64), 8 (g128)}.
+# Emit the BF16/FP16 x INT4 W4A16 kernels plus the SM120/SM121-only
+# BF16 x FP8 W8A16 variant. FP8-activation, MXFP8, INT8, and FP4 variants
+# remain intentionally excluded.
 QUANT_CONFIGS = [
     # AWQ-style asymmetric INT4 (kU4) — kept for forward compatibility
     {
@@ -82,7 +82,18 @@ QUANT_CONFIGS = [
         "thread_m_blocks": THREAD_M_BLOCKS,
         "group_blocks": [-1, 2, 4, 8],
     },
+    {
+        "a_type": ["kBFloat16"],
+        "b_type": "kFE4M3fn",
+        "thread_configs": THREAD_CONFIGS,
+        "thread_m_blocks": THREAD_M_BLOCKS,
+        "group_blocks": [-1, 8],
+    },
 ]
+
+
+def uses_fp8_type(*type_names):
+    return "kFE4M3fn" in type_names or "kFE8M0fnu" in type_names
 
 
 def remove_old_kernels():
@@ -106,11 +117,11 @@ def generate_new_kernels():
         all_thread_configs = quant_config["thread_configs"]
 
         for a_type, c_type in itertools.product(a_types, c_types):
-            if not SUPPORT_FP8 and a_type == "kFE4M3fn":
-                continue
             if "16" in a_type and "16" in c_type and a_type != c_type:
                 continue
             s_type = quant_config.get("s_type", c_type)
+            if not SUPPORT_FP8 and uses_fp8_type(a_type, b_type, c_type, s_type):
+                continue
             if (a_type, b_type, c_type) not in result_dict:
                 result_dict[(a_type, b_type, c_type)] = []
                 if a_type in ["kFloat16", "kS8"] and c_type == "kFloat16":
@@ -151,6 +162,8 @@ def generate_new_kernels():
                     sm_75_result_dict[(a_type, b_type, c_type)].append(config_sm75)
 
     kernel_selector_str = FILE_HEAD_COMMENT
+    emitted_selector_branch = False
+    fp8_selector_guard_open = False
 
     for result_dict_tmp in [result_dict, sm_75_result_dict]:
         for (a_type, b_type, c_type), config_list in result_dict_tmp.items():
@@ -159,6 +172,7 @@ def generate_new_kernels():
                 continue
             for config in config_list:
                 s_type = config["s_type"]
+                selector_uses_fp8 = uses_fp8_type(a_type, b_type, c_type, s_type)
                 template_str = jinja2.Template(TEMPLATE).render(
                     a_type_id=f"vllm::{a_type}.id()",
                     b_type_id=f"vllm::{b_type}.id()",
@@ -184,10 +198,12 @@ def generate_new_kernels():
                 ]
                 conditions = " && ".join(conditions)
 
-                if kernel_selector_str == FILE_HEAD_COMMENT:
-                    kernel_selector_str += f"if ({conditions})\n  kernel = "
-                else:
-                    kernel_selector_str += f"else if ({conditions})\n  kernel = "
+                selector_prefix = "else if" if emitted_selector_branch else "if"
+                if selector_uses_fp8 and not fp8_selector_guard_open:
+                    kernel_selector_str += "#ifdef MARLIN_MOE_ENABLE_FP8_MOE\n"
+                    fp8_selector_guard_open = True
+                kernel_selector_str += f"{selector_prefix} ({conditions})\n  kernel = "
+                emitted_selector_branch = True
 
                 kernel_template2 = (
                     "Marlin<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
@@ -222,9 +238,8 @@ def generate_new_kernels():
             with open(os.path.join(os.path.dirname(__file__), filename), "w") as f:
                 f.write(file_content)
 
-    # modeld-kernels: we never compile FP8-activation kernels in this port,
-    # so emit no fallback `else if` clause.
-    pass
+    if fp8_selector_guard_open:
+        kernel_selector_str += "#endif  // MARLIN_MOE_ENABLE_FP8_MOE\n"
 
     with open(os.path.join(os.path.dirname(__file__), "kernel_selector.h"), "w") as f:
         f.write(kernel_selector_str)

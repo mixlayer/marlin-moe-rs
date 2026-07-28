@@ -1,4 +1,4 @@
-//! Candle CUDA tensor integration for Marlin W4A16 mixture-of-experts inference.
+//! Candle CUDA tensor integration for Marlin W4/W8A16 mixture-of-experts inference.
 
 /// Candle error/result aliases.
 pub mod error;
@@ -12,4 +12,4 @@ mod tensor;
 pub mod workspace;
 
 pub use error::Result;
-pub use moe::{MARLIN_MOE_BLOCK_SIZE, MarlinInt4Moe, marlin_gptq_repack};
+pub use moe::{MARLIN_MOE_BLOCK_SIZE, MarlinFp8Moe, MarlinInt4Moe, marlin_gptq_repack};

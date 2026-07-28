@@ -554,6 +554,9 @@ int64_t marlin_moe_impl_scalar_type_id_u4b8(void) {
 int64_t marlin_moe_impl_scalar_type_id_u4(void) {
   return vllm::kU4.id();
 }
+int64_t marlin_moe_impl_scalar_type_id_fe4m3fn(void) {
+  return vllm::kFE4M3fn.id();
+}
 
 int64_t marlin_moe_impl_moe_wna16_c_tmp_elems(int64_t size_n,
                                             int64_t padded_total,
@@ -611,11 +614,14 @@ void marlin_moe_impl_moe_wna16_gemm(
   TORCH_CHECK(a_type == vllm::kBFloat16 || a_type == vllm::kFloat16,
               "marlin-moe only supports BF16/FP16 activation; got ",
               a_type.str());
-  TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU4,
-              "marlin-moe only supports kU4 / kU4B8 weights; got ",
+  TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU4 ||
+                  b_type == vllm::kFE4M3fn,
+              "marlin-moe only supports kU4 / kU4B8 / kFE4M3fn weights; got ",
               b_type.str());
-  TORCH_CHECK(c_type == a_type, "c_type must match a_type for W4A16");
-  TORCH_CHECK(s_type == c_type, "s_type must match c_type for W4A16");
+  TORCH_CHECK(c_type == a_type,
+              "c_type must match a_type for weight-only Marlin");
+  TORCH_CHECK(s_type == c_type,
+              "s_type must match c_type for weight-only Marlin");
 
   if (moe_block_size != 8) {
     TORCH_CHECK(moe_block_size % 16 == 0,

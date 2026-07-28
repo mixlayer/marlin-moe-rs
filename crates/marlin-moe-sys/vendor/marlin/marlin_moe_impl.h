@@ -25,6 +25,16 @@ int64_t marlin_moe_impl_scalar_type_id_bfloat16(void);
 int64_t marlin_moe_impl_scalar_type_id_float16(void);
 int64_t marlin_moe_impl_scalar_type_id_u4b8(void);
 int64_t marlin_moe_impl_scalar_type_id_u4(void);
+int64_t marlin_moe_impl_scalar_type_id_fe4m3fn(void);
+
+// Packs row-major FP8 `[size_n, size_k]` bytes into I32 and transposes them
+// to `[size_k / 4, size_n]` for the eight-bit Marlin repack kernel.
+void marlin_moe_impl_fp8_pack_transpose(
+    const uint8_t* weight_ptr,
+    uint32_t* packed_transposed_ptr,
+    int64_t size_k,
+    int64_t size_n,
+    cudaStream_t stream);
 
 //
 // GPTQ-style INT4 weight repack: takes packed `int32` weights laid out as
@@ -50,7 +60,7 @@ void marlin_moe_impl_gptq_repack(
     cudaStream_t stream);
 
 //
-// MoE Marlin fused W4A16 GEMM (BF16/FP16 × INT4).
+// MoE Marlin fused weight-only GEMM (BF16/FP16 × INT4/FP8).
 //
 // Weight layout follows `marlin_moe_impl_gptq_repack` output:
 //   b_q_weight: [num_experts, size_k / 16, size_n * 16 / pack_factor] uint32_t
@@ -94,7 +104,7 @@ void marlin_moe_impl_moe_wna16_gemm(
     int64_t size_n,
     int64_t size_k,
     int64_t a_type_id,                  // ScalarType::id() — kBFloat16 or kFloat16
-    int64_t b_type_id,                  // kU4B8 (symmetric) or kU4 (asymmetric)
+    int64_t b_type_id,                  // kU4B8, kU4, or kFE4M3fn
     int64_t c_type_id,                  // matches a_type_id for 16-bit activations
     int64_t s_type_id,                  // matches c_type_id
     bool is_k_full,                     // true when there's no act_order

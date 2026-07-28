@@ -16,6 +16,9 @@ const SOURCES: &[&str] = &[
     "vendor/marlin/moe/moe_sum_reduce.cu",
 ];
 
+const FP8_SOURCES: &[&str] =
+    &["vendor/marlin/moe/marlin_moe_wna16/sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu"];
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     for variable in [
@@ -36,6 +39,9 @@ fn main() {
     for source in SOURCES {
         println!("cargo:rerun-if-changed={source}");
     }
+    for source in FP8_SOURCES {
+        println!("cargo:rerun-if-changed={source}");
+    }
     println!("cargo:rerun-if-changed=csrc/marlin_moe_c_api.h");
     println!("cargo:rerun-if-changed=vendor/marlin");
     println!(
@@ -51,6 +57,13 @@ fn main() {
             return;
         }
     };
+    let enable_fp8 = archs.iter().all(|arch| matches!(arch, 120 | 121));
+    if !enable_fp8 && archs.iter().any(|arch| matches!(arch, 120 | 121)) {
+        panic!(
+            "MARLIN_MOE_ARCHS cannot mix SM120/SM121 with SM80-SM90 because the FP8 selector \
+             is architecture-gated; build separate archives for legacy and SM12x targets"
+        );
+    }
 
     let cuda_root = discover_cuda_root();
     let nvcc = cuda_root.join("bin/nvcc");
@@ -66,14 +79,18 @@ fn main() {
         manifest_dir.join("vendor/marlin/moe/marlin_moe_wna16"),
         cuda_root.join("include"),
     ];
-    let mut objects = Vec::with_capacity(SOURCES.len());
-    for (index, relative) in SOURCES.iter().enumerate() {
+    let sources = SOURCES
+        .iter()
+        .copied()
+        .chain(FP8_SOURCES.iter().copied().filter(|_| enable_fp8));
+    let mut objects = Vec::with_capacity(SOURCES.len() + FP8_SOURCES.len());
+    for (index, relative) in sources.enumerate() {
         let source = manifest_dir.join(relative);
         let object = build_dir.join(format!(
             "{index:02}_{}.o",
             source.file_stem().unwrap().to_string_lossy()
         ));
-        compile(&nvcc, &source, &object, &includes, &archs);
+        compile(&nvcc, &source, &object, &includes, &archs, enable_fp8);
         objects.push(object);
     }
 
@@ -115,9 +132,13 @@ fn selected_archs() -> Result<Vec<u32>, String> {
                 .map_err(|_| format!("invalid Marlin architecture {part:?}"))
         })
         .collect::<Result<_, _>>()?;
-    if archs.is_empty() || archs.iter().any(|arch| !matches!(arch, 80 | 86 | 89 | 90)) {
+    if archs.is_empty()
+        || archs
+            .iter()
+            .any(|arch| !matches!(arch, 80 | 86 | 89 | 90 | 120 | 121))
+    {
         return Err(format!(
-            "Marlin MoE supports SM80, SM86, SM89, and SM90; requested {raw:?}"
+            "Marlin MoE supports SM80, SM86, SM89, SM90, SM120, and SM121; requested {raw:?}"
         ));
     }
     Ok(archs)
@@ -154,7 +175,14 @@ fn find_in_path(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn compile(nvcc: &Path, source: &Path, object: &Path, includes: &[PathBuf], archs: &[u32]) {
+fn compile(
+    nvcc: &Path,
+    source: &Path,
+    object: &Path,
+    includes: &[PathBuf],
+    archs: &[u32],
+    enable_fp8: bool,
+) {
     let mut command = if !truthy("MARLIN_MOE_NO_CCACHE") {
         find_in_path("sccache")
             .or_else(|| find_in_path("ccache"))
@@ -190,6 +218,9 @@ fn compile(nvcc: &Path, source: &Path, object: &Path, includes: &[PathBuf], arch
     }
     if truthy("MARLIN_MOE_PTXAS_VERBOSE") {
         command.arg("--ptxas-options=-v");
+    }
+    if enable_fp8 {
+        command.arg("-DMARLIN_MOE_ENABLE_FP8_MOE=1");
     }
     if let Some(ccbin) = env::var_os("CANDLE_NVCC_CCBIN") {
         command

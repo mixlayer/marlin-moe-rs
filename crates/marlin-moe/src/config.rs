@@ -1,6 +1,6 @@
 use crate::{Error, Result};
 
-/// Activation, output, and scale dtype accepted by W4A16 kernels.
+/// Activation, output, and scale dtype accepted by Marlin WNA16 kernels.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ActivationDtype {
     /// IEEE FP16.
@@ -9,13 +9,15 @@ pub enum ActivationDtype {
     Bf16,
 }
 
-/// Packed four-bit weight interpretation.
+/// Packed weight interpretation.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum WeightDtype {
     /// Symmetric INT4 with implicit bias eight.
     U4B8,
     /// Asymmetric unsigned INT4 with explicit zero points.
     U4,
+    /// E4M3 finite-and-NaN FP8 weights.
+    Fp8E4M3,
 }
 
 /// Validated quantization configuration for a Marlin MoE GEMM.
@@ -25,11 +27,11 @@ pub struct Quantization {
     pub activation: ActivationDtype,
     /// Packed weight interpretation.
     pub weight: WeightDtype,
-    /// Number of K elements sharing one scale; must be 32, 64, or 128.
+    /// Number of K elements sharing one scale; INT4 accepts 32, 64, or 128 and FP8 requires 128.
     pub group_size: usize,
 }
 
-/// Logical dimensions for one routed Marlin W4A16 GEMM.
+/// Logical dimensions for one routed Marlin WNA16 GEMM.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct GemmDims {
     /// Input rows before top-k expansion.
@@ -66,13 +68,24 @@ impl GemmDims {
                 self.k
             )));
         }
-        if !matches!(quantization.group_size, 32 | 64 | 128)
-            || self.k % quantization.group_size != 0
-        {
+        let group_size_supported = match quantization.weight {
+            WeightDtype::Fp8E4M3 => quantization.group_size == 128,
+            WeightDtype::U4B8 | WeightDtype::U4 => {
+                matches!(quantization.group_size, 32 | 64 | 128)
+            }
+        };
+        if !group_size_supported || self.k % quantization.group_size != 0 {
             return Err(Error::InvalidArgument(format!(
-                "group size {} must be 32, 64, or 128 and divide K={}",
-                quantization.group_size, self.k
+                "group size {} is unsupported for {:?} or does not divide K={}",
+                quantization.group_size, quantization.weight, self.k
             )));
+        }
+        if quantization.weight == WeightDtype::Fp8E4M3
+            && quantization.activation != ActivationDtype::Bf16
+        {
+            return Err(Error::InvalidArgument(
+                "FP8 Marlin requires BF16 activations, output, and scales".into(),
+            ));
         }
         if self.num_experts == 0 || self.top_k == 0 {
             return Err(Error::InvalidArgument(
@@ -195,6 +208,40 @@ mod tests {
                 block_size: 32,
             }
             .validate(quantization)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fp8_requires_group_size_128() {
+        let dims = GemmDims {
+            m: 1,
+            n: 128,
+            k: 128,
+            num_experts: 1,
+            top_k: 1,
+            block_size: 32,
+        };
+        assert!(
+            dims.validate(Quantization {
+                activation: ActivationDtype::Bf16,
+                weight: WeightDtype::Fp8E4M3,
+                group_size: 32,
+            })
+            .is_err()
+        );
+        dims.validate(Quantization {
+            activation: ActivationDtype::Bf16,
+            weight: WeightDtype::Fp8E4M3,
+            group_size: 128,
+        })
+        .unwrap();
+        assert!(
+            dims.validate(Quantization {
+                activation: ActivationDtype::F16,
+                weight: WeightDtype::Fp8E4M3,
+                group_size: 128,
+            })
             .is_err()
         );
     }
