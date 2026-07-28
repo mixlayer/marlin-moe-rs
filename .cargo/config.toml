@@ -1,0 +1,4 @@
+[env]
+# Keep CUDA discovery explicit in build.rs. This file exists to mirror the
+# workspace shape used by flashmla-rs without imposing a machine-local path.
+

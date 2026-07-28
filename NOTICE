@@ -1,0 +1,13 @@
+marlin-moe-rs
+Copyright 2026 Mixlayer Labs Inc.
+
+This product includes adapted source code from:
+
+- vLLM, Apache License 2.0
+- SGLang / sgl-kernel, Apache License 2.0
+- Marlin by IST-DASLab, Apache License 2.0
+
+The vendored files are not a git submodule. They are a source snapshot extracted from Mixlayer's
+modeld-kernels integration. Detailed provenance and local modifications are recorded in
+crates/marlin-moe-sys/vendor/PROVENANCE.md.
+

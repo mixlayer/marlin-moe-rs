@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "crates/marlin-moe-sys",
+    "crates/marlin-moe",
+    "crates/candle-marlin-moe",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/mixlayer/marlin-moe-rs"
+
+[workspace.dependencies]
+marlin-moe-sys = { path = "crates/marlin-moe-sys" }
+marlin-moe = { path = "crates/marlin-moe" }
+

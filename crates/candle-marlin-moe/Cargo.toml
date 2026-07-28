@@ -1,0 +1,12 @@
+[package]
+name = "candle-marlin-moe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+candle = { git = "https://github.com/mixlayer/candle", package = "candle-core", branch = "fix/add-i16-i32-cuda-kernels", features = ["cuda"] }
+half = "2.4.1"
+marlin-moe.workspace = true
+tracing = "0.1"
