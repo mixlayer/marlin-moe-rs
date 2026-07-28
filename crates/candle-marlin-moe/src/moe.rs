@@ -1120,7 +1120,6 @@ mod sum_reduce_tests {
     //! (whatever reduction tree `fast_sum_bf16` uses).
     use super::*;
     use candle::Device;
-    use core::ffi::c_void;
 
     fn run_one(m: usize, top_k: usize, hidden: usize, label: &str) -> Result<()> {
         let dev = match Device::new_cuda(0) {

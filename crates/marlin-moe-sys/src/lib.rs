@@ -270,6 +270,23 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "unsupported_arch"))]
+    #[test]
+    fn native_abi_reports_invalid_arguments_without_unwinding() {
+        let status = unsafe {
+            marlin_moe_scalar_type_id(
+                marlin_moe_scalar_type_t::MARLIN_MOE_SCALAR_BFLOAT16,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            status,
+            marlin_moe_status_t::MARLIN_MOE_STATUS_INVALID_ARGUMENT
+        );
+        let message = unsafe { std::ffi::CStr::from_ptr(marlin_moe_last_error()) };
+        assert!(message.to_string_lossy().contains("null"));
+    }
+
     #[cfg(feature = "unsupported_arch")]
     #[test]
     fn unsupported_stub_returns_status_and_diagnostic() {
