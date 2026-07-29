@@ -1,6 +1,5 @@
 [env]
-# Keep CUDA discovery explicit in build.rs. This file exists to mirror the
-# workspace shape used by flashmla-rs without imposing a machine-local path.
+# Keep CUDA discovery explicit in build.rs.
 
 [target.'cfg(any(target_arch = "arm", target_arch = "aarch64"))']
 rustflags = ["-C", "target-feature=+fp16"]
